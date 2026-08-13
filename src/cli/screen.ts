@@ -30,6 +30,9 @@ const ESCAPE = "\u001b";
 
 /** Rows one wheel notch scrolls, matching the feel of prime-agent. */
 const WHEEL_SCROLL_LINES = 3;
+/** Delay before edge auto-scroll starts, and the interval between its steps. */
+const SELECTION_AUTO_SCROLL_DELAY_MS = 150;
+const SELECTION_AUTO_SCROLL_INTERVAL_MS = 50;
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 const SPINNER_INTERVAL_MS = 90;
@@ -144,6 +147,10 @@ export class Screen {
    */
   #tmuxWheelHint = false;
   #attached = false;
+  /** Timer that keeps auto-scrolling while the drag rests on an edge. */
+  #selectionAutoScrollTimer: ReturnType<typeof setTimeout> | null = null;
+  #selectionAutoScrollDirection: 1 | -1 | null = null;
+  #selectionAutoScrollCol = 0;
   readonly #commandNames: ReadonlySet<string>;
 
   constructor(options: ScreenOptions) {
@@ -494,6 +501,53 @@ export class Screen {
     timer.unref();
   }
 
+  /** Start or keep the selection auto-scroll timer for an edge drag. */
+  #updateSelectionAutoScroll(direction: 1 | -1, col: number): void {
+    if (
+      direction === this.#selectionAutoScrollDirection &&
+      this.#selectionAutoScrollTimer !== null
+    ) {
+      this.#selectionAutoScrollCol = col;
+      return;
+    }
+    this.#stopSelectionAutoScroll();
+    this.#selectionAutoScrollDirection = direction;
+    this.#selectionAutoScrollCol = col;
+    this.#selectionAutoScrollTimer = setTimeout(
+      () => this.#selectionAutoScrollTick(),
+      SELECTION_AUTO_SCROLL_DELAY_MS,
+    );
+  }
+
+  /** One auto-scroll step, rescheduled while the drag stays on the edge. */
+  #selectionAutoScrollTick(): void {
+    this.#selectionAutoScrollTimer = null;
+    const direction = this.#selectionAutoScrollDirection;
+    if (direction === null) return;
+    const scrolled = this.#tui.scrollSelection(
+      direction,
+      this.#selectionAutoScrollCol,
+    );
+    if (!scrolled) {
+      const edgeRow = direction === 1 ? 0 : this.#tui.terminal.rows - 1;
+      this.#tui.extendSelection(edgeRow, this.#selectionAutoScrollCol);
+      this.#stopSelectionAutoScroll();
+      return;
+    }
+    this.#selectionAutoScrollTimer = setTimeout(
+      () => this.#selectionAutoScrollTick(),
+      SELECTION_AUTO_SCROLL_INTERVAL_MS,
+    );
+  }
+
+  #stopSelectionAutoScroll(): void {
+    if (this.#selectionAutoScrollTimer !== null) {
+      clearTimeout(this.#selectionAutoScrollTimer);
+      this.#selectionAutoScrollTimer = null;
+    }
+    this.#selectionAutoScrollDirection = null;
+  }
+
   /** Copy text to the system clipboard via the OSC 52 escape sequence. */
   #copySelection(text: string): void {
     const base64 = Buffer.from(text, "utf8").toString("base64");
@@ -589,12 +643,24 @@ export class Screen {
           // Left button: click-drag selects text inside the rendered window.
           // The selection is highlighted live and copied to the system
           // clipboard (OSC 52) on release, which tmux forwards when its
-          // set-clipboard option is on.
+          // set-clipboard option is on. Dragging past the top or bottom edge
+          // auto-scrolls the viewport so a selection can span more than one
+          // screen of history.
           if (mouse.press && !mouse.motion) {
             this.#tui.beginSelection(mouse.y - 1, mouse.x - 1);
           } else if (mouse.press && mouse.motion) {
-            this.#tui.extendSelection(mouse.y - 1, mouse.x - 1);
+            const row = mouse.y - 1;
+            const direction = this.#tui.selectionAutoScrollDirection(row);
+            if (direction !== null) {
+              // Keep a timer running while the drag rests on the edge, so
+              // auto-scroll continues even when the mouse stops moving.
+              this.#updateSelectionAutoScroll(direction, mouse.x - 1);
+            } else {
+              this.#stopSelectionAutoScroll();
+              this.#tui.extendSelection(row, mouse.x - 1);
+            }
           } else if (!mouse.press) {
+            this.#stopSelectionAutoScroll();
             const selected = this.#tui.endSelection();
             if (selected !== null) this.#copySelection(selected);
           }
